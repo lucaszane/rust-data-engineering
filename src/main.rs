@@ -4,28 +4,23 @@ mod records;
 use polars::export::num::NumCast;
 use records::StrokeRecord;
 
-use smartcore::linalg::basic::matrix::DenseMatrix;
-use smartcore::linear::linear_regression::LinearRegression;
-use smartcore::metrics::mean_squared_error;
-use smartcore::model_selection::train_test_split;
-use std::collections::HashMap;
-use std::ops::{DivAssign, MulAssign, SubAssign};
-// use arrow::error::Result as ArrowResult;
 use polars::frame::DataFrame;
 use polars::prelude::PolarsResult;
 use polars::prelude::*;
 use polars_io::parquet::ParquetWriter;
+use smartcore::api::SupervisedEstimator;
+use smartcore::linalg::basic::arrays::MutArray;
+use smartcore::linalg::basic::matrix::DenseMatrix;
+use smartcore::metrics::accuracy;
+use smartcore::model_selection::{KFold, cross_validate};
+use smartcore::neighbors::knn_classifier::KNNClassifier;
+use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fs::File;
+use std::ops::{DivAssign, MulAssign, SubAssign};
 use std::path::Path;
 use std::time::Instant;
 use std::vec::Vec;
-// use the TryFrom to convert exactly the nubmer
-use smartcore::linalg::basic::arrays::{MutArray};
-use std::convert::TryFrom;
-use ndarray::{Array2, Array1};
-
-// use ndarray::Array2;
-// use rulinalg::matrix::Matrix;
 
 use num::Num;
 use polars::prelude::SerReader;
@@ -149,17 +144,27 @@ async fn process_gold() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     df = df.with_column(col("age").alias("age").apply(
-        |s| min_max_scale::<f32>(s),
+        |s| min_max_scale::<f64>(s),
         GetOutput::from_type(DataType::UInt32),
     ));
     df = df.with_column(col("avg_glucose_level").alias("avg_glucose_level").apply(
-        |s| min_max_scale::<f32>(s),
+        |s| min_max_scale::<f64>(s),
         GetOutput::from_type(DataType::UInt32),
     ));
     df = df.with_column(col("bmi").alias("bmi").apply(
-        |s| min_max_scale::<f32>(s),
+        |s| min_max_scale::<f64>(s),
         GetOutput::from_type(DataType::UInt32),
     ));
+
+    df = df.with_column(col("gender").cast(DataType::Float64));
+    df = df.with_column(col("hypertension").cast(DataType::Float64));
+    df = df.with_column(col("heart_disease").cast(DataType::Float64));
+    df = df.with_column(col("ever_married").cast(DataType::Float64));
+    df = df.with_column(col("work_type").cast(DataType::Float64));
+    df = df.with_column(col("Residence_type").cast(DataType::Float64));
+    df = df.with_column(col("smoking_status").cast(DataType::Float64));
+    df = df.with_column(col("bmi").cast(DataType::Float64));
+
 
     // encode(&mut df, "gender")?;
     // encode(&mut df, "ever_married")?;
@@ -205,41 +210,42 @@ pub fn feature_and_target(in_df: &DataFrame) -> PolarsResult<(DataFrame, DataFra
     Ok((features, target))
 }
 
-fn to_ndarray(in_df: &DataFrame) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
-    // Initialize an empty Vec to hold the 1D arrays
-    let mut arrays = Vec::new();
-
-    for name in in_df.get_column_names() {
-        let series = in_df.column(name)?;
-        // Convert the Series to an ndarray Array1 and push it to the Vec
-        let array: Array1<f32> = Array1::from(series.f32()?.cont_slice()?.to_owned());
-        arrays.push(array);
-
-    }
-
-    // Stack the arrays along the second axis
-    let array2 = ndarray::stack(ndarray::Axis(1), arrays)?;
-
-    Ok(array2)
-}
-
 pub fn convert_features_to_matrix(
     in_df: &DataFrame,
 ) -> Result<DenseMatrix<f64>, Box<dyn std::error::Error>> {
     /* function to convert feature dataframe to a DenseMatrix, readable by smartcore*/
 
+    let mut xs: Vec<f64> = Vec::new();
     let nrows = in_df.height();
     let ncols = in_df.width();
-    // convert to array
-    let features_res = to_ndarray(&in_df)?;
-    // create a zero matrix and populate with features
-    let mut xmatrix: DenseMatrix<f64> = DenseMatrix::zeros(nrows, ncols);
+    // in_df.drop_in_place("id");
+
+    let rows: Vec<Series> = in_df.drop("id")?.iter().map(|series| series.clone()).collect();
+
+    // Iterate over the rows
+    for row in rows {
+    //     println!("{:?}", row);
+    // }
+
+    // for row in in_df.iter() {
+        println!("{}", row.head(Some(5)));
+        let inputs: Vec<f64> = row
+            .f64()?
+            .to_vec()
+            .into_iter()
+            .filter_map(|x| x)
+            .collect();
+        xs.extend_from_slice(&inputs);
+    }
+    
+    let mut xmatrix: DenseMatrix<f64> =
+        DenseMatrix::new(nrows, ncols, vec![0.0; nrows * ncols], true);
     // populate the matrix
     // initialize row and column counters
     let mut col: u32 = 0;
     let mut row: u32 = 0;
 
-    for val in features_res.iter() {
+    for val in xs.iter() {
         // Debug
         //println!("{},{}", usize::try_from(row).unwrap(), usize::try_from(col).unwrap());
         // define the row and col in the final matrix as usize
@@ -261,28 +267,50 @@ pub fn convert_features_to_matrix(
     Ok(xmatrix)
 }
 
+
 async fn train_dataset() -> Result<(), Box<dyn std::error::Error>> {
     let mut df = read_parquet(format!("{}{}", GOLD_PATH, STROKE_FILE_NAME).as_str()).await?;
 
     let (features, target) = feature_and_target(&df)?;
+    
     let xmatrix = convert_features_to_matrix(&features)?;
-    let target_array = target.to_ndarray::<Float64Type>()?;
+    println!("I got here2");
+    let target_array: Vec<i32> = target["stroke"].i32()?.into_no_null_iter().collect();
+    println!("I got here3");
     // create a vec type and populate with y values
-    let mut y: Vec<f64> = Vec::new();
+    let mut y: Vec<i32> = Vec::new();
     for val in target_array.iter() {
         y.push(*val);
     }
 
     // train split
-    let (x_train, x_test, y_train, y_test) = train_test_split(&xmatrix, &y, 0.3, true, Some(2));
+    // let (x_train, x_test, y_train, y_test) = train_test_split(&xmatrix, &y, 0.3, true, Some(2));
 
-    // model
-    let linear_regression = LinearRegression::fit(&x_train, &y_train, Default::default()).unwrap();
-    // predictions
-    let preds = linear_regression.predict(&x_test).unwrap();
-    // metrics
-    let mse = mean_squared_error(&y_test, &preds);
-    println!("MSE: {:?}", mse);
+    // // model
+    // let linear_regression = LinearRegression::fit(&x_train, &y_train, Default::default()).unwrap();
+    // // predictions
+    // let preds = linear_regression.predict(&x_test).unwrap();
+
+    // let y_hat_knn = KNNClassifier::fit(
+    //     &x_train,
+    //     &y_train,        
+    //     Default::default(),
+    // ).and_then(|knn| knn.predict(&x_test)).unwrap();
+
+  
+    let cv = KFold::default().with_n_splits(3);
+    
+    let results = cross_validate(
+        KNNClassifier::new(),   //estimator
+        &xmatrix, &y,                 //data
+        Default::default(),     //hyperparameters
+        &cv,                     //cross validation split
+        &accuracy).unwrap();    //metric
+    
+    println!("Training accuracy: {}, test accuracy: {}",
+        results.mean_test_score(), results.mean_train_score());
+    
+
 
     Ok(())
 }
