@@ -107,7 +107,6 @@ async fn process_silver() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // println!("{}", df.head(Some(5)));
 
     Ok(())
 }
@@ -173,7 +172,6 @@ async fn process_gold() -> Result<(), Box<dyn std::error::Error>> {
     // encode(&mut df, "work_type")?;
 
     let mut final_df = df.collect()?;
-    println!("{}", final_df.head(Some(5)));
 
     write_csv(
         format!("{}{}", GOLD_PATH, "debug.csv").as_str(),
@@ -224,10 +222,6 @@ pub fn convert_features_to_matrix(
 
     // Iterate over the rows
     for row in rows {
-    //     println!("{:?}", row);
-    // }
-
-    // for row in in_df.iter() {
         println!("{}", row.head(Some(5)));
         let inputs: Vec<f64> = row
             .f64()?
@@ -247,7 +241,6 @@ pub fn convert_features_to_matrix(
 
     for val in xs.iter() {
         // Debug
-        //println!("{},{}", usize::try_from(row).unwrap(), usize::try_from(col).unwrap());
         // define the row and col in the final matrix as usize
         let m_row = usize::try_from(row).unwrap();
         let m_col = usize::try_from(col).unwrap();
@@ -274,9 +267,7 @@ async fn train_dataset() -> Result<(), Box<dyn std::error::Error>> {
     let (features, target) = feature_and_target(&df)?;
     
     let xmatrix = convert_features_to_matrix(&features)?;
-    println!("I got here2");
     let target_array: Vec<i32> = target["stroke"].i32()?.into_no_null_iter().collect();
-    println!("I got here3");
     // create a vec type and populate with y values
     let mut y: Vec<i32> = Vec::new();
     for val in target_array.iter() {
