@@ -8,12 +8,13 @@ use polars::frame::DataFrame;
 use polars::prelude::PolarsResult;
 use polars::prelude::*;
 use polars_io::parquet::ParquetWriter;
-use smartcore::api::SupervisedEstimator;
 use smartcore::linalg::basic::arrays::MutArray;
 use smartcore::linalg::basic::matrix::DenseMatrix;
+
 use smartcore::metrics::accuracy;
-use smartcore::model_selection::{KFold, cross_validate};
-use smartcore::neighbors::knn_classifier::KNNClassifier;
+use smartcore::model_selection::{train_test_split, KFold, cross_validate};
+
+use smartcore::tree::decision_tree_classifier::{DecisionTreeClassifier, DecisionTreeClassifierParameters};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs::File;
@@ -21,15 +22,18 @@ use std::ops::{DivAssign, MulAssign, SubAssign};
 use std::path::Path;
 use std::time::Instant;
 use std::vec::Vec;
+use sysinfo::{System, SystemExt};
 
 use num::Num;
 use polars::prelude::SerReader;
 
+
 fn monitor_memory() -> u64 {
+    let sys = System::new_all();
     // Implement memory monitoring logic
     // This might involve reading from /proc/self/status on Linux
     // or using a crate like `sys-info` if cross-platform support is needed
-    return 1;
+    return sys.used_memory();
 }
 
 pub async fn read_parquet<P: AsRef<Path>>(path: P) -> PolarsResult<DataFrame> {
@@ -142,6 +146,17 @@ async fn process_gold() -> Result<(), Box<dyn std::error::Error>> {
             .apply(encode_lazy, GetOutput::from_type(DataType::UInt32)),
     );
 
+    
+    df = df.with_column(col("gender").cast(DataType::Float64));
+    df = df.with_column(col("hypertension").cast(DataType::Float64));
+    df = df.with_column(col("heart_disease").cast(DataType::Float64));
+    df = df.with_column(col("ever_married").cast(DataType::Float64));
+    df = df.with_column(col("work_type").cast(DataType::Float64));
+    df = df.with_column(col("Residence_type").cast(DataType::Float64));
+    df = df.with_column(col("smoking_status").cast(DataType::Float64));
+    df = df.with_column(col("bmi").cast(DataType::Float64));
+    df = df.with_column(col("stroke").cast(DataType::UInt32));
+
     df = df.with_column(col("age").alias("age").apply(
         |s| min_max_scale::<f64>(s),
         GetOutput::from_type(DataType::UInt32),
@@ -154,15 +169,27 @@ async fn process_gold() -> Result<(), Box<dyn std::error::Error>> {
         |s| min_max_scale::<f64>(s),
         GetOutput::from_type(DataType::UInt32),
     ));
+    df = df.with_column(col("gender").alias("gender").apply(
+        |s| min_max_scale::<f64>(s),
+        GetOutput::from_type(DataType::UInt32),
+    ));
+    df = df.with_column(col("ever_married").alias("ever_married").apply(
+        |s| min_max_scale::<f64>(s),
+        GetOutput::from_type(DataType::UInt32),
+    ));
+    df = df.with_column(col("Residence_type").alias("Residence_type").apply(
+        |s| min_max_scale::<f64>(s),
+        GetOutput::from_type(DataType::UInt32),
+    ));
+    df = df.with_column(col("smoking_status").alias("smoking_status").apply(
+        |s| min_max_scale::<f64>(s),
+        GetOutput::from_type(DataType::UInt32),
+    ));
+    df = df.with_column(col("work_type").alias("work_type").apply(
+        |s| min_max_scale::<f64>(s),
+        GetOutput::from_type(DataType::UInt32),
+    ));
 
-    df = df.with_column(col("gender").cast(DataType::Float64));
-    df = df.with_column(col("hypertension").cast(DataType::Float64));
-    df = df.with_column(col("heart_disease").cast(DataType::Float64));
-    df = df.with_column(col("ever_married").cast(DataType::Float64));
-    df = df.with_column(col("work_type").cast(DataType::Float64));
-    df = df.with_column(col("Residence_type").cast(DataType::Float64));
-    df = df.with_column(col("smoking_status").cast(DataType::Float64));
-    df = df.with_column(col("bmi").cast(DataType::Float64));
 
 
     // encode(&mut df, "gender")?;
@@ -222,7 +249,6 @@ pub fn convert_features_to_matrix(
 
     // Iterate over the rows
     for row in rows {
-        println!("{}", row.head(Some(5)));
         let inputs: Vec<f64> = row
             .f64()?
             .to_vec()
@@ -255,51 +281,132 @@ pub fn convert_features_to_matrix(
             col += 1;
         }
     }
+    // println!("{}", xmatrix);
 
     // Ok so we can return DenseMatrix, otherwise we'll have std::result::Result<Densematrix, PolarsError>
     Ok(xmatrix)
 }
 
 
+pub fn convert_features_to_matrix2(
+    in_df: &DataFrame,
+) -> Result<DenseMatrix<f64>, Box<dyn std::error::Error>> {
+    /* function to convert feature dataframe to a DenseMatrix, readable by smartcore*/
+
+    let n = [concat_list([
+    col("gender"),
+    col("age"),
+    col("hypertension"),
+    col("heart_disease"),
+    col("ever_married"),
+    col("work_type"),
+    col("Residence_type"),
+    col("avg_glucose_level"),
+    col("bmi"),
+    col("smoking_status")
+    ])?.alias("data")];
+    let df = in_df.clone().lazy().select(n).collect()?;
+    
+    // iterate through the column and convert each number in the nested list into an f64
+    let data = df
+        .column("data")?
+        .list()?
+        .into_no_null_iter()
+        .map(|n| {
+            n.f64().unwrap()
+            .into_no_null_iter()
+            .map(|n| n as f64)
+            .collect::<Vec<f64>>()
+        })
+        .collect::<Vec<Vec<f64>>>();
+    
+    let matrix = DenseMatrix::from_2d_vec(&data);
+
+    // println!("{}", matrix);
+
+    Ok(matrix)
+}
+
+
+
 async fn train_dataset() -> Result<(), Box<dyn std::error::Error>> {
-    let mut df = read_parquet(format!("{}{}", GOLD_PATH, STROKE_FILE_NAME).as_str()).await?;
+    let df = read_parquet(format!("{}{}", GOLD_PATH, STROKE_FILE_NAME).as_str()).await?;
 
     let (features, target) = feature_and_target(&df)?;
     
     let xmatrix = convert_features_to_matrix(&features)?;
-    let target_array: Vec<i32> = target["stroke"].i32()?.into_no_null_iter().collect();
+    let target_array: Vec<u32> = target["stroke"].u32()?.into_no_null_iter().collect();
     // create a vec type and populate with y values
-    let mut y: Vec<i32> = Vec::new();
+    let mut y: Vec<u32> = Vec::new();
     for val in target_array.iter() {
         y.push(*val);
     }
 
-    // train split
-    // let (x_train, x_test, y_train, y_test) = train_test_split(&xmatrix, &y, 0.3, true, Some(2));
+    //train split
+    let (x_train, x_test, y_train, y_test) = train_test_split(&xmatrix, &y, 0.3, true, Some(2));
 
     // // model
     // let linear_regression = LinearRegression::fit(&x_train, &y_train, Default::default()).unwrap();
     // // predictions
     // let preds = linear_regression.predict(&x_test).unwrap();
 
-    // let y_hat_knn = KNNClassifier::fit(
-    //     &x_train,
-    //     &y_train,        
-    //     Default::default(),
-    // ).and_then(|knn| knn.predict(&x_test)).unwrap();
+    let classifier = DecisionTreeClassifier::fit(
+        &x_train,
+        &y_train,        
+        DecisionTreeClassifierParameters::default(),
+    )?;
+
+    let y_predict = classifier.predict(&x_test)?;
+
+    // println!("{:?}", y_predict);
+    // println!("{:?}", y_test);
+
+    let mut equal = 0;
+    let mut different = 0;
+    let mut tp = 0;
+    let mut fp = 0;
+    let mut tn = 0;
+    let mut fneg = 0;
+    for (i, val) in y_test.iter().enumerate() {
+        if *val == y_predict[i] {
+            equal = equal + 1;
+            if *val == 1 {
+                tp = tp + 1;
+            } else {
+                tn = tn + 1;
+            }
+        } else {
+            different = different + 1;
+            if *val == 0 {
+                fp = fp + 1;
+            } else {
+                fneg = fneg + 1;
+            }
+        }
+
+    }
+
+    println!("equals: {}", equal);
+    println!("different: {}", different);
+    println!("accuracy: {}", (equal) as f32 / (equal + different)  as f32);
+    println!("tp: {}", tp);
+    println!("fp: {}", fp);
+    println!("tn: {}", tn);
+    println!("fneg: {}", fneg);
+
 
   
     let cv = KFold::default().with_n_splits(3);
     
     let results = cross_validate(
-        KNNClassifier::new(),   //estimator
+        classifier,   //estimator
         &xmatrix, &y,                 //data
         Default::default(),     //hyperparameters
         &cv,                     //cross validation split
         &accuracy).unwrap();    //metric
     
     println!("Training accuracy: {}, test accuracy: {}",
-        results.mean_test_score(), results.mean_train_score());
+        results.mean_train_score(), results.mean_test_score());
     
 
 
@@ -338,19 +445,34 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = Instant::now();
     let start_memory = monitor_memory();
+    let start_time = Instant::now();
 
     process_raw().await?;
+
+    println!("process_raw time is: {:?}", start_time.elapsed());
+    let process_silver_start = Instant::now();
+
     process_silver().await?;
+
+    println!("process_silver_start time is: {:?}", process_silver_start.elapsed());
+    let process_gold_start = Instant::now();
+
     process_gold().await?;
+
+    println!("process_gold_start time is: {:?}", process_gold_start.elapsed());
+    let train_dataset_start = Instant::now();
+
     train_dataset().await?;
 
-    let end_memory = monitor_memory();
-    let duration = start_time.elapsed();
+    println!("train_dataset_start time is: {:?}", train_dataset_start.elapsed());
 
-    println!("Time elapsed in expensive_function is: {:?}", duration);
-    println!("Memory used: {:?}", end_memory - start_memory);
+    let duration = start_time.elapsed();
+    println!("Time elapsed in all functions is: {:?}", duration);
+    
+    let end_memory = monitor_memory();
+    let base: i32 = 1024;
+    println!("Memory used: {:?} MB", ((end_memory - start_memory) as f32 / (base.pow(2) as f32)));
 
     Ok(())
 }
